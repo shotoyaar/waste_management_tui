@@ -5,10 +5,37 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"strings"
 
+	"github.com/charmbracelet/bubbles/cursor"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	gloss "github.com/charmbracelet/lipgloss"
 	_ "github.com/mattn/go-sqlite3"
+)
+
+var (
+	focusedStyle        = gloss.NewStyle().Foreground(gloss.Color("205"))
+	blurredStyle        = gloss.NewStyle().Foreground(gloss.Color("240"))
+	cursorStyle         = focusedStyle
+	noStyle             = gloss.NewStyle()
+	helpStyle           = blurredStyle
+	cursorModeHelpStyle = gloss.NewStyle().Foreground(gloss.Color("244"))
+
+	focusedButton = focusedStyle.Render("[Submit]")
+	blurredButton = fmt.Sprintf("[ %s ]", blurredStyle.Render("Submit"))
+
+	titleStyle = gloss.NewStyle().
+			Bold(true).
+			Foreground(gloss.Color("#FAFAFA")).
+			Background(gloss.Color("#7D56F4")).
+			Padding(0, 1)
+
+	selectedStyle = gloss.NewStyle().
+			Foreground(gloss.Color("#FFFFFF")).
+			Background(gloss.Color("#0000FF"))
+
+	errorStyle = gloss.NewStyle().Foreground(gloss.Color("9"))
 )
 
 type wasteItem struct {
@@ -21,12 +48,14 @@ type wasteItem struct {
 }
 
 type model struct {
-	db        *sql.DB
-	waste     []wasteItem
-	cursor    int
-	input     string
-	inputmode inputmode
-	err       error
+	db         *sql.DB
+	waste      []wasteItem
+	cursor     int
+	inputs     []textinput.Model
+	inputmode  inputmode
+	err        error
+	cursorMode cursor.Mode
+	focusIndex int
 }
 
 type inputmode int
@@ -46,11 +75,44 @@ func initialModel(db *sql.DB) model {
 		log.Fatalf("Error loading waste items: %v", err)
 	}
 
-	return model{
+	m := model{
+		inputs:    make([]textinput.Model, 5),
 		db:        db,
 		waste:     waste,
 		inputmode: normal,
 	}
+
+	var t textinput.Model
+
+	for i := range m.inputs {
+		t = textinput.New()
+		t.Cursor.Style = cursorStyle
+		t.CharLimit = 64
+
+		switch i {
+		case 0:
+			t.Placeholder = "Waste Name"
+			t.Focus()
+			t.PromptStyle = focusedStyle
+			t.TextStyle = focusedStyle
+
+		case 1:
+			t.Placeholder = "Waste Quantity"
+
+		case 2:
+			t.Placeholder = "Waste Type"
+
+		case 3:
+			t.Placeholder = "Waste Location"
+
+		case 4:
+			t.Placeholder = "Disposal Method"
+		}
+
+		m.inputs[i] = t
+	}
+
+	return m
 }
 
 func loadWasteItems(db *sql.DB) ([]wasteItem, error) {
@@ -77,7 +139,7 @@ func loadWasteItems(db *sql.DB) ([]wasteItem, error) {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return textinput.Blink
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -86,16 +148,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.inputmode {
 		case normal:
 			return m.updateNormal(msg)
-
-		case addingName, addingWasteType, addingLocation, addingMethod:
-			return m.updateAddingText(msg)
-
-		case addingQuantity:
-			return m.updateAddingQuantity(msg)
+		case addingName, addingWasteType, addingLocation, addingMethod, addingQuantity:
+			return m.updateAdding(msg)
 		}
 	}
 
-	return m, nil
+	cmd := m.updateInputs(msg)
+	return m, cmd
+}
+
+func (m model) updateInputs(msg tea.Msg) tea.Cmd {
+	cmds := make([]tea.Cmd, len(m.inputs))
+
+	for i := range m.inputs {
+		m.inputs[i], cmds[i] = m.inputs[i].Update(msg)
+	}
+
+	return tea.Batch(cmds...)
 }
 
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -103,19 +172,59 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+c", "q":
 		return m, tea.Quit
 
-	case "up", "k":
-		if m.cursor > 0 {
-			m.cursor--
+	case "ctrl+r":
+		m.cursorMode++
+
+		if m.cursorMode > cursor.CursorHide {
+			m.cursorMode = cursor.CursorBlink
 		}
 
-	case "down", "j":
-		if m.cursor < len(m.waste)-1 {
-			m.cursor++
+		cmds := make([]tea.Cmd, len(m.inputs))
+		for i := range m.inputs {
+			cmds[i] = m.inputs[i].Cursor.SetMode(m.cursorMode)
 		}
+
+		return m, tea.Batch(cmds...)
+
+	case "tab", "shift+tab", "up", "down":
+		s := msg.String()
+
+		if s == "enter" && m.focusIndex == len(m.inputs) {
+			return m, tea.Quit
+		}
+
+		if s == "up" || s == "shift+tab" {
+			m.focusIndex--
+		} else {
+			m.focusIndex++
+		}
+
+		if m.focusIndex > len(m.inputs) {
+			m.focusIndex = 0
+		} else if m.focusIndex < 0 {
+			m.focusIndex = len(m.inputs)
+		}
+
+		cmds := make([]tea.Cmd, len(m.inputs))
+		for i := 0; i <= len(m.inputs)-1; i++ {
+			if i == m.focusIndex {
+				cmds[i] = m.inputs[i].Focus()
+				m.inputs[i].PromptStyle = focusedStyle
+				m.inputs[i].TextStyle = focusedStyle
+				continue
+			}
+
+			m.inputs[i].Blur()
+			m.inputs[i].PromptStyle = noStyle
+			m.inputs[i].TextStyle = noStyle
+		}
+
+		return m, tea.Batch(cmds...)
 
 	case "a":
 		m.inputmode = addingName
-		m.input = ""
+		m.focusIndex = 0
+		return m, m.inputs[0].Focus()
 
 	case "d":
 		if len(m.waste) > 0 {
@@ -136,66 +245,50 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) updateAddingText(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) updateAdding(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "enter":
-		switch m.inputmode {
-		case addingName:
-			m.waste = append(m.waste, wasteItem{name: m.input})
-			m.inputmode = addingQuantity
-
-		case addingWasteType:
-			m.waste[len(m.waste)-1].wasteType = m.input
-			m.inputmode = addingLocation
-
-		case addingLocation:
-			m.waste[len(m.waste)-1].location = m.input
-			m.inputmode = addingMethod
-
-		case addingMethod:
-			m.waste[len(m.waste)-1].method = m.input
-			err := m.addWasteItem(m.waste[len(m.waste)-1])
-			if err != nil {
-				m.err = fmt.Errorf("failed to add item: %v", err)
-			}
-
-			m.inputmode = normal
+		if m.focusIndex < len(m.inputs)-1 {
+			m.focusIndex++
+			return m, m.inputs[m.focusIndex].Focus()
+		} else {
+			return m.submitWasteItem()
 		}
-
-		m.input = ""
 
 	case "esc":
 		m.inputmode = normal
-		m.input = ""
-
-	default:
-		m.input += msg.String()
+		m.focusIndex = 0
+		return m, nil
 	}
-
 	return m, nil
 }
 
-func (m model) updateAddingQuantity(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "enter":
-		quantity, err := strconv.ParseFloat(m.input, 64)
+func (m model) submitWasteItem() (tea.Model, tea.Cmd) {
+	quantity, err := strconv.ParseFloat(m.inputs[1].Value(), 64)
+	if err != nil {
+		m.err = fmt.Errorf("invalid quantity: %v", err)
+		return m, nil
+	}
 
-		if err != nil {
-			m.err = fmt.Errorf("invalid quantity entered: %v", err)
-		} else {
-			m.waste[len(m.waste)-1].quantity = quantity
-			m.inputmode = addingWasteType
-			m.err = nil
+	newItem := wasteItem{
+		name:      m.inputs[0].Value(),
+		quantity:  quantity,
+		wasteType: m.inputs[2].Value(),
+		location:  m.inputs[3].Value(),
+		method:    m.inputs[4].Value(),
+	}
+
+	err = m.addWasteItem(newItem)
+	if err != nil {
+		m.err = fmt.Errorf("failed to add item: %v", err)
+	} else {
+		m.inputmode = normal
+
+		for i := range m.inputs {
+			m.inputs[i].SetValue("")
 		}
 
-		m.input = ""
-
-	case "esc":
-		m.inputmode = normal
-		m.input = ""
-
-	default:
-		m.input += msg.String()
+		m.focusIndex = 0
 	}
 
 	return m, nil
@@ -225,69 +318,95 @@ func (m model) deleteWasteItem(id int) error {
 }
 
 func (m model) View() string {
-	s := "Waste Management System\n\n"
+	var b strings.Builder
 
-	// Define Styles
-	titleStyle := gloss.NewStyle().
-		Bold(true).
-		Foreground(gloss.Color("#FAFAFA")).
-		Background(gloss.Color("#7D56F4")).
-		Padding(0, 1)
+	// Title
+	b.WriteString(titleStyle.Render("Waste Management System"))
+	b.WriteString("\n\n")
 
-	selectedStyle := gloss.NewStyle().
-		Foreground(gloss.Color("#FFFFFF")).
-		Background(gloss.Color("#0000FF"))
+	// Waste Items Table
+	if len(m.waste) > 0 {
+		b.WriteString(titleStyle.Render("Current Waste Items"))
+		b.WriteString("\n")
+		b.WriteString(titleStyle.Render("Name | Type | Quantity | Location | Disposal Method"))
+		b.WriteString("\n")
 
-	s += titleStyle.Render("Name | Type | Quantity | Location | Disposal Method") + "\n"
+		for i, item := range m.waste {
+			line := fmt.Sprintf("%-10s | %-10s | %-8.2f | %-10s | %-15s",
+				item.name, item.wasteType, item.quantity, item.location, item.method)
 
-	for i, item := range m.waste {
-		line := fmt.Sprintf("%-10s | %-10s | %-8.2f | %-10s | %-15s", item.name, item.wasteType, item.quantity, item.location, item.method)
-
-		if m.cursor == i {
-			s += selectedStyle.Render(line)
-		} else {
-			s += line
+			if m.cursor == i && m.inputmode == normal {
+				b.WriteString(selectedStyle.Render(line))
+			} else {
+				b.WriteString(line)
+			}
+			b.WriteString("\n")
 		}
-
-		s += "\n"
+		b.WriteString("\n")
 	}
 
-	s += "\n"
+	// Input Fields
+	if m.inputmode != normal {
+		b.WriteString(titleStyle.Render("Add New Waste Item"))
+		b.WriteString("\n")
 
+		for i := range m.inputs {
+			b.WriteString(m.inputs[i].View())
+			if i < len(m.inputs)-1 {
+				b.WriteRune('\n')
+			}
+		}
+
+		button := &blurredButton
+		if m.focusIndex == len(m.inputs) {
+			button = &focusedButton
+		}
+		fmt.Fprintf(&b, "\n\n%s\n\n", *button)
+	}
+
+	// Help Text
+	b.WriteString(helpStyle.Render("cursor mode is "))
+	b.WriteString(cursorModeHelpStyle.Render(m.cursorMode.String()))
+	b.WriteString(helpStyle.Render(" (ctrl+r to change style)"))
+	b.WriteString("\n")
+
+	// Instructions
 	if m.inputmode == normal {
-		s += "Press (a) to add, (d) to delete, up/down to move, (q) to quit\n"
+		b.WriteString(helpStyle.Render("Press (a) to add, (d) to delete, up/down to move, (q) to quit"))
 	} else {
-		s += fmt.Sprintf("Enter %s: %s", getInputModeName(m.inputmode), m.input)
-
-		if m.err != nil {
-			s += fmt.Sprintf("\nError: %v", m.err)
-		}
+		b.WriteString(helpStyle.Render("Press (enter) to move to next field, (esc) to cancel"))
 	}
 
-	return s
-}
-
-func getInputModeName(mode inputmode) string {
-	switch mode {
-	case addingName:
-		return "waste name"
-
-	case addingQuantity:
-		return "quantity"
-
-	case addingWasteType:
-		return "waste type"
-
-	case addingLocation:
-		return "location"
-
-	case addingMethod:
-		return "disposal method"
-
-	default:
-		return ""
+	// Error display
+	if m.err != nil {
+		b.WriteString("\n")
+		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
 	}
+
+	return b.String()
 }
+
+// func getInputModeName(mode inputmode) string {
+// 	switch mode {
+// 	case addingName:
+// 		return "waste name"
+
+// 	case addingQuantity:
+// 		return "quantity"
+
+// 	case addingWasteType:
+// 		return "waste type"
+
+// 	case addingLocation:
+// 		return "location"
+
+// 	case addingMethod:
+// 		return "disposal method"
+
+// 	default:
+// 		return ""
+// 	}
+// }
 
 func main() {
 	db, err := sql.Open("sqlite3", "./waste_management.db")
